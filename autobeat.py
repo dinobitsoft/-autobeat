@@ -7,6 +7,72 @@ from typing import Dict, Any, Optional
 import requests
 from bs4 import BeautifulSoup
 
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship, sessionmaker
+from datetime import datetime
+
+Base = declarative_base()
+
+class Car(Base):
+    __tablename__ = 'cars'
+
+    id = Column(Integer, primary_key=True)
+    url = Column(String, unique=True, nullable=False)
+    characteristics = Column(JSON)
+
+    price_histories = relationship("CarPriceHistory", back_populates="car")
+
+class CarPriceHistory(Base):
+    __tablename__ = 'car_price_histories'
+
+    id = Column(Integer, primary_key=True)
+    car_id = Column(Integer, ForeignKey('cars.id'), nullable=False)
+    price = Column(String)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+    car = relationship("Car", back_populates="price_histories")
+
+class CarSnapshot(Base):
+    __tablename__ = 'car_snapshots'
+
+    id = Column(Integer, primary_key=True)
+    car_id = Column(Integer, ForeignKey('cars.id'), nullable=False)
+    characteristics = Column(JSON)
+    first_seen_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+def store_data(url, price, characteristics, engine=None):
+    if engine is None:
+        raise ValueError("engine required")
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        # Check if car exists
+        car = session.query(Car).filter_by(url=url).first()
+        if not car:
+            car = Car(url=url, characteristics=characteristics)
+            session.add(car)
+            session.commit()
+        
+        # Add price history only if price changed
+        last_price = session.query(CarPriceHistory).filter_by(car_id=car.id).order_by(CarPriceHistory.fetched_at.desc()).first()
+        if not last_price or last_price.price != str(price):
+            price_history = CarPriceHistory(car_id=car.id, price=str(price))
+            session.add(price_history)
+        
+        # Handle snapshot
+        last_snapshot = session.query(CarSnapshot).filter_by(car_id=car.id).order_by(CarSnapshot.first_seen_at.desc()).first()
+        if not last_snapshot or last_snapshot.characteristics != characteristics:
+            snapshot = CarSnapshot(car_id=car.id, characteristics=characteristics)
+            session.add(snapshot)
+        else:
+            last_snapshot.last_seen_at = datetime.utcnow()
+        
+        session.commit()
+    finally:
+        session.close()
+
 
 URL = "https://abw.by/cars/detail/tesla/model-y/25832105"
 LOCAL_FILE = "25832105.html"
