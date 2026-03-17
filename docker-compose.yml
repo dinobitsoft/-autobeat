@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: cars
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  seaweedfs:
+    image: chrislusf/seaweedfs
+    command: server -dir=/data -s3
+    ports:
+      - "8333:8333"
+      - "8888:8888"
+      - "9333:9333"
+
+  crawler:
+    build: .
+    command: python crawler_worker.py
+    depends_on:
+      - postgres
+      - rabbitmq
+      - redis
+      - seaweedfs
+
+  images:
+    build: .
+    command: python image_worker.py
+    depends_on:
+      - postgres
+      - rabbitmq
+      - seaweedfs
+
+  discovery:
+    build: .
+    command: python discovery_worker.py
+    depends_on:
+      - rabbitmq
