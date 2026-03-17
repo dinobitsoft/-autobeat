@@ -3,6 +3,8 @@ import os
 POSTGRES_URL = "postgresql+psycopg://postgres:postgres@postgres:5432/cars"
 
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "admin")
+RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "admin")
 
 REDIS_HOST = "redis"
 

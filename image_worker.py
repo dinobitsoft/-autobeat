@@ -1,11 +1,14 @@
 import requests
 from message_queue import consume
 from storage import upload_image
-from db import Session
+from db import Session, init_db
 from models import CarImage
 from worker_logging import get_logger
 
 logger = get_logger("image_worker")
+
+init_db()
+logger.info("database ready")
 
 
 def worker(data):

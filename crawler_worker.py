@@ -2,12 +2,15 @@ from playwright.sync_api import sync_playwright
 import hashlib
 from parser import parse
 from message_queue import consume, publish
-from db import Session
+from db import Session, init_db
 from models import Car, CarSnapshot
 from datetime import datetime
 from worker_logging import get_logger
 
 logger = get_logger("crawler_worker")
+
+init_db()
+logger.info("database ready")
 
 
 def worker(data):

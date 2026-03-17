@@ -1,35 +1,48 @@
 import re
 from bs4 import BeautifulSoup
+from typing import Dict, Any, Optional
+
+from worker_logging import get_logger
+
+logger = get_logger("crawler_worker")
 
 
-def normalize_price(text):
+def parse_price(soup: BeautifulSoup) -> Optional[int]:
+    price = soup.select_one("[class*=price]").get_text(strip=True)
+    logger.info(f"parsed price={price} ")
+    return normalize_price(price) if price else None
 
-    text = text.replace("\xa0", "")
 
-    digits = re.findall(r"\d+", text)
 
-    return int("".join(digits))
+def parse_characteristics(soup: BeautifulSoup) -> Dict[str, Any]:
+    characteristics = {}
+
+    params = soup.select(".param")
+
+    for idx, p in enumerate(params):
+        value = p.get_text(strip=True)
+        if value:
+            characteristics[f"param_{idx}"] = value
+
+    return characteristics
+
+
+def normalize_price(text: str) -> int | None:
+    if not text:
+        return None
+    if "$" in text and "≈" in text:
+        text = text.split("≈")[-1]
+    digits = re.sub(r"[^\d]", "", text)
+    return int(digits) if digits else None
 
 
 def parse(html):
 
     soup = BeautifulSoup(html, "html.parser")
 
-    price_el = soup.select_one(".card-price")
+    price = parse_price(soup)
 
-    price = normalize_price(price_el.text)
-
-    characteristics = {}
-
-    rows = soup.select(".card-specifications__item")
-
-    for r in rows:
-
-        key = r.select_one(".card-specifications__name")
-
-        val = r.select_one(".card-specifications__value")
-
-        characteristics[key.text.strip()] = val.text.strip()
+    characteristics = parse_characteristics(soup)
 
     images = []
 

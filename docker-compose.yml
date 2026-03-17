@@ -10,6 +10,11 @@ services:
       POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7
@@ -18,9 +23,18 @@ services:
 
   rabbitmq:
     image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
     ports:
       - "5672:5672"
       - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
 
   seaweedfs:
     image: chrislusf/seaweedfs
@@ -33,22 +47,33 @@ services:
   crawler:
     build: .
     command: python crawler_worker.py
+    restart: unless-stopped
     depends_on:
-      - postgres
-      - rabbitmq
-      - redis
-      - seaweedfs
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      seaweedfs:
+        condition: service_started
 
   images:
     build: .
     command: python image_worker.py
+    restart: unless-stopped
     depends_on:
-      - postgres
-      - rabbitmq
-      - seaweedfs
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
 
   discovery:
     build: .
     command: python discovery_worker.py
+    restart: on-failure
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
