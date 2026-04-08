@@ -19,7 +19,21 @@ class Car(Base):
 
     id = Column(Integer, primary_key=True)
     url = Column(String, unique=True, nullable=False)
-    characteristics = Column(JSON)
+    year = Column(String)
+    body_type = Column(String)
+    transmission = Column(String)
+    engine = Column(String)
+    drivetrain = Column(String)
+    condition = Column(String)
+    color = Column(String)
+    availability = Column(String)
+    mileage = Column(String)
+    brand = Column(String)
+    model = Column(String)
+    generation = Column(String)
+    modification = Column(String)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
 
     price_histories = relationship("CarPriceHistory", back_populates="car")
 
