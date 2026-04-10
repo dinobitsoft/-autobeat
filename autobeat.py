@@ -31,6 +31,7 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int]:
                 logging.info("New car: %s", scraped_car.url)
                 inserted += 1
             else:
+                logging.info("Updated car: %s", scraped_car.url)
                 updated += 1
 
             for field in _UPSERT_FIELDS:
@@ -44,11 +45,7 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int]:
                 .order_by(CarPriceHistory.fetched_at.desc())
                 .first()
             )
-            price_changed = (
-                not last_price
-                or last_price.price != scraped_car.price
-                or last_price.price_local_currency != scraped_car.price_local_currency
-            )
+            price_changed = not last_price or last_price.price != scraped_car.price
             if price_changed:
                 if last_price:
                     logging.info(
@@ -118,8 +115,11 @@ def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> Non
         all_urls.update(car.url for car in cars)
         resume_page = 1  # only the first brand may have a partial page offset
 
-    total_sold = mark_sold_cars(all_urls)
-    logging.info("Daily summary — inserted: %d, updated: %d, sold: %d", total_inserted, total_updated, total_sold)
+    if resume_brand:
+        logging.info("Daily summary (partial run) — inserted: %d, updated: %d (sold check skipped, partial scrape)", total_inserted, total_updated)
+    else:
+        total_sold = mark_sold_cars(all_urls)
+        logging.info("Daily summary — inserted: %d, updated: %d, sold: %d", total_inserted, total_updated, total_sold)
 
 
 URL = "https://abw.by/cars/detail/tesla/model-y/25832105"
@@ -328,7 +328,7 @@ def fetch_all_brand_cars(brand: CarBrand) -> List[Car]:
 
 def main() -> None:
     init_db()
-    daily_check(resume_brand="peugeot", resume_page=55)
+    daily_check() #not done yet
 
 
 if __name__ == "__main__":
