@@ -124,7 +124,6 @@ def _maybe_visit_detail(cars: List[Car]) -> None:
     car = random.choice(cars)
     logging.info("Human detail visit: %s", car.url)
     fetch_html(car.url)
-    _human_delay()
 
 
 def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> None:
@@ -142,40 +141,97 @@ def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> Non
             resume_page = 1
 
     human_mode = not resume_brand
-    if human_mode:
-        random.shuffle(brands)
-        logging.info("Human mode: brands shuffled into random order")
+
+    # pre-calculate page counts for all brands
+    brand_map = {b.title: b for b in brands}
+    brand_pages = {b.title: brand_page_count(b) for b in brands}
+    total_pages_all = sum(brand_pages.values())
+    logging.info("Plan: %d brands, %d pages total", len(brands), total_pages_all)
+
+    # build pool: brand_title -> shuffled list of pages to fetch
+    pool: Dict[str, List[int]] = {}
+    for b in brands:
+        start = resume_page if b.title == resume_brand else 1
+        pages = list(range(start, brand_pages[b.title] + 1))
+        if human_mode:
+            random.shuffle(pages)
+        pool[b.title] = pages
 
     total_inserted = total_updated = total_skipped = 0
     all_urls: set = set()
     brand_stats: List[tuple] = []  # (title, updated, skipped)
-    for brand in brands:
-        pages = brand_page_count(brand)
-        start_page = resume_page if brand.title == (resume_brand or brand.title) else 1
-        logging.info("Parsing brand '%s' — %d cars, %d page(s), starting page %d", brand.title, brand.count, pages, start_page)
+    cars_buffer: Dict[str, List[Car]] = {title: [] for title in pool}
+    pages_done = 0
+    pages_left = total_pages_all
+    timedout_brands: Dict[str, List[int]] = {}  # brand_title -> [page, ...]
 
-        page_order = list(range(start_page, pages + 1))
+    while pool:
+        brand_title = random.choice(list(pool.keys())) if human_mode else next(iter(pool))
+        page = pool[brand_title].pop(0)
+        pages_done += 1
+        pages_left -= 1
+        brands_left = len(pool)
+
+        logging.info(
+            "Fetching '%s' page %d / %d | brands left: %d, pages left: %d",
+            brand_title, page, brand_pages[brand_title], brands_left, pages_left,
+        )
+        try:
+            batch = fetch_brand_page(brand_map[brand_title], page)
+        except Exception:
+            logging.warning(
+                "Brand '%s' page %d timed out — queued for retry at end",
+                brand_title, page,
+            )
+            timedout_brands.setdefault(brand_title, []).append(page)
+            # if brand has no more pages, don't persist yet — retry pass may add cars
+            if not pool[brand_title]:
+                del pool[brand_title]
+            continue
+
+        cars_buffer[brand_title].extend(batch)
+
         if human_mode:
-            random.shuffle(page_order)
+            _maybe_visit_detail(batch)
+            _human_delay()
 
-        cars = []
-        for page in page_order:
-            logging.info("Fetching brand '%s' page %d / %d", brand.title, page, pages)
-            batch = fetch_brand_page(brand, page)
-            cars.extend(batch)
-            if human_mode:
-                _maybe_visit_detail(batch)
-                _human_delay()
+        # brand fully fetched — persist and remove from pool
+        if not pool[brand_title]:
+            del pool[brand_title]
+            # skip persist if there are still timed-out pages pending for this brand
+            if brand_title not in timedout_brands:
+                cars = cars_buffer.pop(brand_title)
+                logging.info("Brand '%s' done — fetched %d cars, persisting...", brand_title, len(cars))
+                inserted, updated, skipped = persist_cars(cars)
+                logging.info("Brand '%s' persist result — new: %d, updated: %d, skipped: %d", brand_title, inserted, updated, skipped)
+                total_inserted += inserted
+                total_updated += updated
+                total_skipped += skipped
+                brand_stats.append((brand_title, updated, skipped))
+                all_urls.update(car.url for car in cars)
 
-        logging.info("Brand '%s' done — fetched %d cars, persisting...", brand.title, len(cars))
-        inserted, updated, skipped = persist_cars(cars)
-        logging.info("Brand '%s' persist result — new: %d, updated: %d, skipped: %d", brand.title, inserted, updated, skipped)
-        total_inserted += inserted
-        total_updated += updated
-        total_skipped += skipped
-        brand_stats.append((brand.title, updated, skipped))
-        all_urls.update(car.url for car in cars)
-        resume_page = 1  # only the first brand may have a partial page offset
+    # retry timed-out pages
+    if timedout_brands:
+        logging.info("Retrying %d timed-out brand/page entries...", sum(len(v) for v in timedout_brands.values()))
+        for brand_title, pages in timedout_brands.items():
+            for page in pages:
+                logging.info("Retry fetching '%s' page %d", brand_title, page)
+                try:
+                    batch = fetch_brand_page(brand_map[brand_title], page)
+                    cars_buffer.setdefault(brand_title, []).extend(batch)
+                except Exception:
+                    logging.warning("Retry also failed for '%s' page %d — skipping", brand_title, page)
+            cars = cars_buffer.pop(brand_title, [])
+            logging.info("Brand '%s' retry done — fetched %d cars, persisting...", brand_title, len(cars))
+            inserted, updated, skipped = persist_cars(cars)
+            logging.info("Brand '%s' retry persist result — new: %d, updated: %d, skipped: %d", brand_title, inserted, updated, skipped)
+            total_inserted += inserted
+            total_updated += updated
+            total_skipped += skipped
+            brand_stats.append((brand_title, updated, skipped))
+            all_urls.update(car.url for car in cars)
+
+    resume_page = 1  # reset after loop (only relevant for resume path)
 
     col_w = max((len(t) for t, _, _ in brand_stats), default=5)
     sep = f"+{'-' * (col_w + 2)}+{'-' * 10}+{'-' * 10}+"
@@ -236,6 +292,8 @@ def fetch_html(url):
             page.wait_for_load_state("domcontentloaded", timeout=60000)
         except Exception:
             logging.warning("Timeout/error loading %s, using partial content", url)
+            browser.close()
+            raise
 
         html = page.content()
         browser.close()
