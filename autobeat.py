@@ -1,5 +1,8 @@
 import logging
+import random
 import re
+import sys
+import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -17,10 +20,10 @@ _UPSERT_FIELDS = [
 ]
 
 
-def persist_cars(scraped: List[Car]) -> tuple[int, int]:
-    """Upsert scraped cars. Returns (inserted, updated) counts."""
+def persist_cars(scraped: List[Car]) -> tuple[int, int, int]:
+    """Upsert scraped cars. Returns (inserted, updated, skipped) counts."""
     session = get_session()
-    inserted = updated = 0
+    inserted = updated = skipped = 0
     try:
         for scraped_car in scraped:
             db_car = session.query(Car).filter_by(url=scraped_car.url).first()
@@ -31,8 +34,16 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int]:
                 logging.info("New car: %s", scraped_car.url)
                 inserted += 1
             else:
-                logging.info("Updated car: %s", scraped_car.url)
-                updated += 1
+                changed = [
+                    f"{f}: {getattr(db_car, f)!r} → {getattr(scraped_car, f)!r}"
+                    for f in _UPSERT_FIELDS
+                    if getattr(db_car, f) != getattr(scraped_car, f)
+                ]
+                if changed:
+                    logging.info("Updated car %s — %s", scraped_car.url, ", ".join(changed))
+                    updated += 1
+                else:
+                    skipped += 1
 
             for field in _UPSERT_FIELDS:
                 setattr(db_car, field, getattr(scraped_car, field))
@@ -45,7 +56,13 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int]:
                 .order_by(CarPriceHistory.fetched_at.desc())
                 .first()
             )
-            price_changed = not last_price or last_price.price != scraped_car.price
+            price_changed = (
+                not last_price
+                or (
+                    last_price.price != scraped_car.price
+                    and last_price.price_local_currency != scraped_car.price_local_currency
+                )
+            )
             if price_changed:
                 if last_price:
                     logging.info(
@@ -61,7 +78,7 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int]:
         session.commit()
     finally:
         session.close()
-    return inserted, updated
+    return inserted, updated, skipped
 
 
 def mark_sold_cars(active_urls: set) -> int:
@@ -83,6 +100,33 @@ def mark_sold_cars(active_urls: set) -> int:
         session.close()
 
 
+_DETAIL_VISIT_CHANCE = 0.3  # probability of visiting a random detail page after a listing page
+
+
+def _human_delay() -> None:
+    total = random.uniform(0, 180)
+    logging.info("Human delay: %.1f s", total)
+    remaining = total
+    while remaining > 0:
+        sys.stderr.write(f"\r  sleeping... {remaining:.1f}s left   ")
+        sys.stderr.flush()
+        chunk = min(1.0, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+    sys.stderr.write("\r" + " " * 40 + "\r")
+    sys.stderr.flush()
+
+
+def _maybe_visit_detail(cars: List[Car]) -> None:
+    """Occasionally fetch a random car detail page to mimic a human clicking a listing."""
+    if not cars or random.random() > _DETAIL_VISIT_CHANCE:
+        return
+    car = random.choice(cars)
+    logging.info("Human detail visit: %s", car.url)
+    fetch_html(car.url)
+    _human_delay()
+
+
 def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> None:
     brands = parse_brand_list(fetch_html(f"{BASE_URL}/"))
     logging.info("Found %d brands, %d cars total", len(brands), sum(b.count for b in brands))
@@ -97,29 +141,60 @@ def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> Non
             logging.warning("Resume brand '%s' not found, starting from scratch", resume_brand)
             resume_page = 1
 
-    total_inserted = total_updated = 0
+    human_mode = not resume_brand
+    if human_mode:
+        random.shuffle(brands)
+        logging.info("Human mode: brands shuffled into random order")
+
+    total_inserted = total_updated = total_skipped = 0
     all_urls: set = set()
+    brand_stats: List[tuple] = []  # (title, updated, skipped)
     for brand in brands:
         pages = brand_page_count(brand)
         start_page = resume_page if brand.title == (resume_brand or brand.title) else 1
         logging.info("Parsing brand '%s' — %d cars, %d page(s), starting page %d", brand.title, brand.count, pages, start_page)
 
+        page_order = list(range(start_page, pages + 1))
+        if human_mode:
+            random.shuffle(page_order)
+
         cars = []
-        for page in range(start_page, pages + 1):
-            cars.extend(fetch_brand_page(brand, page))
+        for page in page_order:
+            logging.info("Fetching brand '%s' page %d / %d", brand.title, page, pages)
+            batch = fetch_brand_page(brand, page)
+            cars.extend(batch)
+            if human_mode:
+                _maybe_visit_detail(batch)
+                _human_delay()
 
         logging.info("Brand '%s' done — fetched %d cars, persisting...", brand.title, len(cars))
-        inserted, updated = persist_cars(cars)
+        inserted, updated, skipped = persist_cars(cars)
+        logging.info("Brand '%s' persist result — new: %d, updated: %d, skipped: %d", brand.title, inserted, updated, skipped)
         total_inserted += inserted
         total_updated += updated
+        total_skipped += skipped
+        brand_stats.append((brand.title, updated, skipped))
         all_urls.update(car.url for car in cars)
         resume_page = 1  # only the first brand may have a partial page offset
 
+    col_w = max((len(t) for t, _, _ in brand_stats), default=5)
+    sep = f"+{'-' * (col_w + 2)}+{'-' * 10}+{'-' * 10}+"
+    header = f"| {'Brand':<{col_w}} | {'Updates':>8} | {'Skipped':>8} |"
+    rows = "\n".join(
+        f"| {t:<{col_w}} | {u:>8} | {s:>8} |"
+        for t, u, s in brand_stats
+    )
+    total_row = f"| {'TOTAL':<{col_w}} | {total_updated:>8} | {total_skipped:>8} |"
+    report = f"\n{sep}\n{header}\n{sep}\n{rows}\n{sep}\n{total_row}\n{sep}"
+
     if resume_brand:
-        logging.info("Daily summary (partial run) — inserted: %d, updated: %d (sold check skipped, partial scrape)", total_inserted, total_updated)
+        logging.info("Crawl finished (partial)%s", report)
     else:
         total_sold = mark_sold_cars(all_urls)
-        logging.info("Daily summary — inserted: %d, updated: %d, sold: %d", total_inserted, total_updated, total_sold)
+        logging.info(
+            "Crawl finished — brands: %d, total cars: %d, new: %d, sold: %d%s",
+            len(brands), len(all_urls), total_inserted, total_sold, report,
+        )
 
 
 URL = "https://abw.by/cars/detail/tesla/model-y/25832105"
@@ -142,11 +217,25 @@ URL = "https://abw.by/cars/detail/tesla/model-y/25832105"
 # -------------------------------
 def fetch_html(url):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            viewport={"width": random.randint(1280, 1920), "height": random.randint(800, 1080)},
+            locale="ru-RU",
+        )
+        # hide webdriver fingerprint
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page = context.new_page()
 
-        page.goto(url)
-        page.wait_for_load_state("networkidle")
+        try:
+            page.goto(url, timeout=60000)
+            # domcontentloaded is enough for scraped content; networkidle can hang forever
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+        except Exception:
+            logging.warning("Timeout/error loading %s, using partial content", url)
 
         html = page.content()
         browser.close()
