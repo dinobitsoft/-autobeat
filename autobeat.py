@@ -27,6 +27,7 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int, int]:
     try:
         for scraped_car in scraped:
             db_car = session.query(Car).filter_by(url=scraped_car.url).first()
+            changed = []
             if not db_car:
                 db_car = Car(url=scraped_car.url)
                 session.add(db_car)
@@ -41,9 +42,6 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int, int]:
                 ]
                 if changed:
                     logging.info("Updated car %s — %s", scraped_car.url, ", ".join(changed))
-                    updated += 1
-                else:
-                    skipped += 1
 
             for field in _UPSERT_FIELDS:
                 setattr(db_car, field, getattr(scraped_car, field))
@@ -69,6 +67,12 @@ def persist_cars(scraped: List[Car]) -> tuple[int, int, int]:
                         "Price change for %s: $%s → $%s",
                         scraped_car.url, last_price.price, scraped_car.price,
                     )
+
+            if db_car.id:  # existing car
+                if changed or price_changed:
+                    updated += 1
+                else:
+                    skipped += 1
                 session.add(CarPriceHistory(
                     car_id=db_car.id,
                     price=scraped_car.price,
@@ -100,11 +104,11 @@ def mark_sold_cars(active_urls: set) -> int:
         session.close()
 
 
-_DETAIL_VISIT_CHANCE = 0.3  # probability of visiting a random detail page after a listing page
+from config import DETAIL_VISIT_CHANCE, HUMAN_DELAY_MAX_S
 
 
 def _human_delay() -> None:
-    total = random.uniform(0, 180)
+    total = random.uniform(0, HUMAN_DELAY_MAX_S)
     logging.info("Human delay: %.1f s", total)
     remaining = total
     while remaining > 0:
@@ -119,11 +123,14 @@ def _human_delay() -> None:
 
 def _maybe_visit_detail(cars: List[Car]) -> None:
     """Occasionally fetch a random car detail page to mimic a human clicking a listing."""
-    if not cars or random.random() > _DETAIL_VISIT_CHANCE:
+    if not cars or random.random() > DETAIL_VISIT_CHANCE:
         return
     car = random.choice(cars)
     logging.info("Human detail visit: %s", car.url)
-    fetch_html(car.url)
+    try:
+        fetch_html(car.url)
+    except Exception:
+        logging.warning("Detail visit timed out for %s — skipping", car.url)
 
 
 def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> None:
@@ -149,33 +156,34 @@ def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> Non
     logging.info("Plan: %d brands, %d pages total", len(brands), total_pages_all)
 
     # build pool: brand_title -> shuffled list of pages to fetch
-    pool: Dict[str, List[int]] = {}
+    # build flat list of (brand_title, page) and shuffle for human mode
+    work_queue: List[tuple] = []
     for b in brands:
         start = resume_page if b.title == resume_brand else 1
-        pages = list(range(start, brand_pages[b.title] + 1))
-        if human_mode:
-            random.shuffle(pages)
-        pool[b.title] = pages
+        for p in range(start, brand_pages[b.title] + 1):
+            work_queue.append((b.title, p))
+    if human_mode:
+        random.shuffle(work_queue)
 
     total_inserted = total_updated = total_skipped = 0
     all_urls: set = set()
     brand_stats: List[tuple] = []  # (title, updated, skipped)
-    cars_buffer: Dict[str, List[Car]] = {title: [] for title in pool}
-    pages_done = 0
+    timedout_pages: List[tuple] = []  # (brand_title, page)
     pages_left = total_pages_all
-    timedout_brands: Dict[str, List[int]] = {}  # brand_title -> [page, ...]
+    brands_seen: set = set()
+    brands_left = len({bt for bt, _ in work_queue})
 
-    while pool:
-        brand_title = random.choice(list(pool.keys())) if human_mode else next(iter(pool))
-        page = pool[brand_title].pop(0)
-        pages_done += 1
+    for brand_title, page in work_queue:
         pages_left -= 1
-        brands_left = len(pool)
+        if brand_title not in brands_seen:
+            brands_seen.add(brand_title)
+            brands_left -= 1
 
         logging.info(
             "Fetching '%s' page %d / %d | brands left: %d, pages left: %d",
             brand_title, page, brand_pages[brand_title], brands_left, pages_left,
         )
+
         try:
             batch = fetch_brand_page(brand_map[brand_title], page)
         except Exception:
@@ -183,53 +191,41 @@ def daily_check(resume_brand: Optional[str] = None, resume_page: int = 1) -> Non
                 "Brand '%s' page %d timed out — queued for retry at end",
                 brand_title, page,
             )
-            timedout_brands.setdefault(brand_title, []).append(page)
-            # if brand has no more pages, don't persist yet — retry pass may add cars
-            if not pool[brand_title]:
-                del pool[brand_title]
+            timedout_pages.append((brand_title, page))
+            if human_mode:
+                _human_delay()
             continue
 
-        cars_buffer[brand_title].extend(batch)
+        logging.info("Brand '%s' page %d done — fetched %d cars, persisting...", brand_title, page, len(batch))
+        inserted, updated, skipped = persist_cars(batch)
+        logging.info("Brand '%s' page %d persist result — new: %d, updated: %d, skipped: %d", brand_title, page, inserted, updated, skipped)
+        total_inserted += inserted
+        total_updated += updated
+        total_skipped += skipped
+        brand_stats.append((brand_title, updated, skipped))
+        all_urls.update(car.url for car in batch)
 
         if human_mode:
             _maybe_visit_detail(batch)
-            _human_delay()
-
-        # brand fully fetched — persist and remove from pool
-        if not pool[brand_title]:
-            del pool[brand_title]
-            # skip persist if there are still timed-out pages pending for this brand
-            if brand_title not in timedout_brands:
-                cars = cars_buffer.pop(brand_title)
-                logging.info("Brand '%s' done — fetched %d cars, persisting...", brand_title, len(cars))
-                inserted, updated, skipped = persist_cars(cars)
-                logging.info("Brand '%s' persist result — new: %d, updated: %d, skipped: %d", brand_title, inserted, updated, skipped)
-                total_inserted += inserted
-                total_updated += updated
-                total_skipped += skipped
-                brand_stats.append((brand_title, updated, skipped))
-                all_urls.update(car.url for car in cars)
 
     # retry timed-out pages
-    if timedout_brands:
-        logging.info("Retrying %d timed-out brand/page entries...", sum(len(v) for v in timedout_brands.values()))
-        for brand_title, pages in timedout_brands.items():
-            for page in pages:
-                logging.info("Retry fetching '%s' page %d", brand_title, page)
-                try:
-                    batch = fetch_brand_page(brand_map[brand_title], page)
-                    cars_buffer.setdefault(brand_title, []).extend(batch)
-                except Exception:
-                    logging.warning("Retry also failed for '%s' page %d — skipping", brand_title, page)
-            cars = cars_buffer.pop(brand_title, [])
-            logging.info("Brand '%s' retry done — fetched %d cars, persisting...", brand_title, len(cars))
-            inserted, updated, skipped = persist_cars(cars)
-            logging.info("Brand '%s' retry persist result — new: %d, updated: %d, skipped: %d", brand_title, inserted, updated, skipped)
+    if timedout_pages:
+        logging.info("Retrying %d timed-out pages...", len(timedout_pages))
+        for brand_title, page in timedout_pages:
+            logging.info("Retry fetching '%s' page %d", brand_title, page)
+            try:
+                batch = fetch_brand_page(brand_map[brand_title], page)
+            except Exception:
+                logging.warning("Retry also failed for '%s' page %d — skipping", brand_title, page)
+                continue
+            logging.info("Brand '%s' page %d retry done — fetched %d cars, persisting...", brand_title, page, len(batch))
+            inserted, updated, skipped = persist_cars(batch)
+            logging.info("Brand '%s' page %d retry persist result — new: %d, updated: %d, skipped: %d", brand_title, page, inserted, updated, skipped)
             total_inserted += inserted
             total_updated += updated
             total_skipped += skipped
             brand_stats.append((brand_title, updated, skipped))
-            all_urls.update(car.url for car in cars)
+            all_urls.update(car.url for car in batch)
 
     resume_page = 1  # reset after loop (only relevant for resume path)
 

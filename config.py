@@ -12,3 +12,6 @@ S3_ENDPOINT = "http://seaweedfs:8888"
 S3_BUCKET = "car-images"
 S3_ACCESS_KEY = "admin"
 S3_SECRET_KEY = "admin"
+
+DETAIL_VISIT_CHANCE = 0.3  # probability of visiting a random detail page after a listing page
+HUMAN_DELAY_MAX_S = 60     # max random delay in seconds between page fetches
